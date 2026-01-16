@@ -253,13 +253,17 @@ def run_imbalanced_contrastive_analysis(non_issue_df, sar_df):
         hedge_df = pd.DataFrame(hedge_comparison).sort_values('odds_ratio', ascending=False)
         
         print("\nHedges more common in SAR:")
-        for _, row in hedge_df[hedge_df['odds_ratio'] > 1].head(10).iterrows():
+        sar_hedges = hedge_df[hedge_df['odds_ratio'] > 1].head(10)
+        for _, row in sar_hedges.iterrows():
             print(f"  {row['hedge']:<40} OR={row['odds_ratio']:>5.1f}  "
                   f"SAR:{row['sar_freq_pct']:>5.1f}%  NI:{row['ni_freq_pct']:>5.1f}%")
         
         print("\nHedges more common in Non-Issue:")
-        for _, row in hedge_df[hedge_df['odds_ratio'] < 1].tail(10).iterrows():
-            print(f"  {row['hedge']:<40} OR={row['odds_ratio']:>5.1f}  "
+        ni_hedges = hedge_df[hedge_df['odds_ratio'] < 1].tail(10)
+        for _, row in ni_hedges.iterrows():
+            # Safe division for display
+            inv_or = 1 / row['odds_ratio'] if row['odds_ratio'] > 0 else float('inf')
+            print(f"  {row['hedge']:<40} OR={inv_or:>5.1f}  "
                   f"NI:{row['ni_freq_pct']:>5.1f}%  SAR:{row['sar_freq_pct']:>5.1f}%")
         
         hedge_df.to_csv('hedge_analysis_imbalanced.csv', index=False)
