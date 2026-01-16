@@ -1,360 +1,300 @@
 import pandas as pd
 import numpy as np
-from scipy.stats import fisher_exact, chi2_contingency
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.ensemble import IsolationForest
-from itertools import combinations, product
+from scipy.stats import fisher_exact
+from itertools import combinations
 import re
-from collections import defaultdict, Counter
+from collections import defaultdict
 import warnings
 warnings.filterwarnings('ignore')
 
-class RareContrastSetMiner:
+class ImbalancedRarePatternMiner:
     """
-    Mine RARE but statistically significant patterns that distinguish SAR from non-issue.
+    Rare pattern mining optimized for 14,000 vs 680 imbalance
     
-    This finds combinations like:
-    - "High jewelry spend" + "new business" + "narrative mentions 'gift cards'" = 8% of SARs, 0.5% of non-issue
-    - "Electronics merchant" + "weekend deposits" + "round amounts" + "narrative says 'customer requested'" = rare but highly suspicious
-    
-    Focus on patterns that appear in 5-15% of SARs but <2% of non-issue (precision over recall)
+    Key adaptations:
+    1. SAR-focused: Look for patterns in 30-150 SARs (5-22% of minority class)
+    2. Absolute counts, not percentages: min 30 SAR, max 30 non-issue
+    3. Fisher's exact test for significance
+    4. High precision requirement (>80%) to avoid false positives
     """
     
-    def __init__(self, min_support_sar=0.05, max_support_sar=0.20, 
-                 max_support_non_issue=0.02, min_confidence=0.70):
-        self.min_support_sar = min_support_sar
-        self.max_support_sar = max_support_sar
-        self.max_support_non_issue = max_support_non_issue
-        self.min_confidence = min_confidence
+    def __init__(self, min_sar_support=30, max_sar_support=150, 
+                 max_ni_support=30, min_precision=0.80):
+        self.min_sar_support = min_sar_support      # ~5% of 680 SARs
+        self.max_sar_support = max_sar_support      # ~22% of 680 SARs
+        self.max_ni_support = max_ni_support        # ~0.2% of 14,000 non-issue
+        self.min_precision = min_precision
         
     def extract_narrative_features(self, narrative):
-        """
-        Extract binary features from narratives that could interact with transaction features
-        """
+        """Extract binary features from narratives"""
         if pd.isna(narrative):
             return {}
         
         text = str(narrative).lower()
         
         features = {
-            # Customer behavior signals
-            'narrative_customer_requested': bool(re.search(r'customer (requested|asked|instructed|demanded)', text)),
-            'narrative_customer_refused': bool(re.search(r'(refused|declined|unwilling|would not)', text)),
-            'narrative_customer_evasive': bool(re.search(r'(evasive|vague|unclear|unable to explain)', text)),
-            'narrative_customer_pressured': bool(re.search(r'(urgent|immediately|rush|time sensitive)', text)),
+            # Customer behavior
+            'narr_customer_requested': bool(re.search(r'customer (requested|asked|instructed|demanded)', text)),
+            'narr_customer_refused': bool(re.search(r'(refused|declined|unwilling|would not)', text)),
+            'narr_customer_evasive': bool(re.search(r'(evasive|vague|unclear response|unable to explain)', text)),
+            'narr_customer_unresponsive': bool(re.search(r'(no response|did not respond|failed to respond)', text)),
             
-            # Documentation signals
-            'narrative_no_documentation': bool(re.search(r'(no documentation|lack of (records|invoices|receipts)|unable to provide)', text)),
-            'narrative_inconsistent_docs': bool(re.search(r'(inconsistent|conflicting|discrepancy|mismatch)', text)),
-            'narrative_altered_docs': bool(re.search(r'(altered|modified|changed|tampered)', text)),
+            # Documentation
+            'narr_no_documentation': bool(re.search(r'(no documentation|lack of (records|invoices)|unable to provide)', text)),
+            'narr_inconsistent_docs': bool(re.search(r'(inconsistent|conflicting|discrepancy)', text)),
+            'narr_docs_provided': bool(re.search(r'(documentation|records|invoices) (provided|submitted|received)', text)),
             
-            # Business legitimacy signals
-            'narrative_new_business': bool(re.search(r'(new business|recently (opened|formed|incorporated)|startup)', text)),
-            'narrative_shell_company': bool(re.search(r'(shell company|no physical|no operations|no employees)', text)),
-            'narrative_cash_intensive': bool(re.search(r'cash[ -]intensive', text)),
-            'narrative_high_risk_industry': bool(re.search(r'(money service|remittance|crypto|virtual currency|precious metal|jewelry)', text)),
+            # Verification
+            'narr_unable_verify': bool(re.search(r'unable to (verify|confirm|validate)', text)),
+            'narr_verified': bool(re.search(r'verified (with|by|through)', text)),
+            'narr_attempted_contact': bool(re.search(r'attempted to (contact|reach)', text)),
             
-            # Transaction pattern signals
-            'narrative_structuring': bool(re.search(r'(structur|smurfing|layering|below reporting)', text)),
-            'narrative_round_amounts': bool(re.search(r'(round (dollar )?amount|even amount)', text)),
-            'narrative_rapid_movement': bool(re.search(r'(rapid|quick|immediate|same day|shortly after)', text)),
-            'narrative_multiple_parties': bool(re.search(r'(multiple (parties|entities|accounts)|third[- ]party)', text)),
+            # Business legitimacy
+            'narr_new_business': bool(re.search(r'(new business|recently (opened|formed))', text)),
+            'narr_cash_intensive': bool(re.search(r'cash[ -]intensive', text)),
+            'narr_legitimate_business': bool(re.search(r'legitimate (business|activity|purpose)', text)),
             
-            # Geographic signals
-            'narrative_high_risk_country': bool(re.search(r'(offshore|foreign|international|overseas)', text)),
-            'narrative_multiple_jurisdictions': bool(re.search(r'(multiple (countries|jurisdictions)|cross[- ]border)', text)),
+            # Transaction patterns
+            'narr_structuring': bool(re.search(r'(structur|smurfing|below reporting)', text)),
+            'narr_round_amounts': bool(re.search(r'(round (dollar )?amount|even amount)', text)),
+            'narr_rapid_movement': bool(re.search(r'(rapid|quick|immediate|same day)', text)),
+            'narr_unusual_pattern': bool(re.search(r'unusual (pattern|activity|behavior)', text)),
             
-            # Investigator findings
-            'narrative_unable_to_verify': bool(re.search(r'unable to (verify|confirm|validate)', text)),
-            'narrative_attempted_contact': bool(re.search(r'(attempted to contact|tried to reach|no response)', text)),
-            'narrative_conflicting_info': bool(re.search(r'(conflicting|contradictory|discrepan)', text)),
+            # Geographic
+            'narr_high_risk_country': bool(re.search(r'(offshore|foreign|high[- ]risk (country|jurisdiction))', text)),
+            'narr_multiple_jurisdictions': bool(re.search(r'(multiple (countries|jurisdictions)|cross[- ]border)', text)),
             
-            # Positive signals (green flags)
-            'narrative_verified_source': bool(re.search(r'(verified|confirmed|documented) (with|by|through)', text)),
-            'narrative_legitimate_business': bool(re.search(r'(legitimate business|normal (business|commercial)|consistent with)', text)),
-            'narrative_known_customer': bool(re.search(r'(long[- ]standing|established|known) customer', text)),
+            # Conclusions
+            'narr_suspicious': bool(re.search(r'\bsuspicious\b', text)),
+            'narr_concerning': bool(re.search(r'\bconcerning\b', text)),
+            'narr_normal': bool(re.search(r'(normal|typical|expected) (activity|behavior|pattern)', text)),
+            'narr_consistent': bool(re.search(r'consistent with', text)),
         }
         
         return features
     
-    def create_combined_feature_space(self, df, narrative_col='NARRATIVE'):
-        """
-        Combine transaction features with narrative-derived features
-        """
+    def create_feature_matrix(self, df, narrative_col='NARRATIVE'):
+        """Create binary feature matrix from narratives"""
         # Extract narrative features
         narrative_features = df[narrative_col].apply(self.extract_narrative_features)
         narrative_df = pd.DataFrame(list(narrative_features))
         
-        # Get transaction features (exclude ID and narrative columns)
+        # Get any transaction features if they exist
         exclude_cols = ['ALERT_ID', 'SAR_ID', 'NARRATIVE', 'label']
         trans_cols = [col for col in df.columns if col not in exclude_cols]
         
         if trans_cols:
-            # Combine
-            combined_df = pd.concat([df[trans_cols].reset_index(drop=True), 
+            # Binarize transaction features if needed
+            trans_df = df[trans_cols].copy()
+            
+            for col in trans_df.columns:
+                if trans_df[col].dtype in ['int64', 'float64']:
+                    unique_vals = trans_df[col].nunique()
+                    if unique_vals > 10:
+                        # Bin into high/low
+                        median = trans_df[col].median()
+                        trans_df[col] = (trans_df[col] > median).astype(int)
+            
+            combined_df = pd.concat([trans_df.reset_index(drop=True), 
                                     narrative_df.reset_index(drop=True)], axis=1)
         else:
             combined_df = narrative_df
         
         return combined_df
     
-    def discretize_continuous_features(self, df, n_bins=5):
+    def mine_rare_patterns(self, sar_df, non_issue_df):
         """
-        Convert continuous features to categorical bins for pattern mining
+        Mine patterns that are rare but highly indicative
+        Focus on minority class (SAR)
         """
-        df_discrete = df.copy()
+        print("1. Creating feature matrices...")
+        sar_features = self.create_feature_matrix(sar_df)
+        ni_features = self.create_feature_matrix(non_issue_df)
         
-        for col in df.columns:
-            if df[col].dtype in ['int64', 'float64']:
-                # Check if it's already binary
-                unique_vals = df[col].nunique()
-                if unique_vals <= 2:
-                    df_discrete[col] = df[col].astype(bool)
-                elif unique_vals <= 10:
-                    # Keep as is if few categories
-                    df_discrete[col] = df[col].astype(str)
-                else:
-                    # Bin continuous features
-                    df_discrete[col] = pd.qcut(df[col], q=n_bins, labels=False, duplicates='drop')
-                    df_discrete[col] = f"{col}_q" + df_discrete[col].astype(str)
+        print(f"   SAR features: {sar_features.shape}")
+        print(f"   Non-Issue features: {ni_features.shape}")
         
-        return df_discrete
-    
-    def mine_emerging_patterns(self, sar_df, non_issue_df):
-        """
-        Find patterns that emerge strongly in SAR class (Emerging Pattern Mining)
-        These are combinations of features that are rare but highly discriminative
-        """
-        # Convert to binary/categorical
-        sar_discrete = self.discretize_continuous_features(sar_df)
-        non_issue_discrete = self.discretize_continuous_features(non_issue_df)
+        # Find frequent itemsets in SAR class only
+        print("\n2. Mining patterns in SAR class...")
+        sar_patterns = self._find_itemsets(sar_features, 
+                                           min_support=self.min_sar_support,
+                                           max_support=self.max_sar_support)
         
-        # Mine frequent itemsets in each class
-        sar_patterns = self._find_frequent_itemsets(sar_discrete, 
-                                                     min_support=self.min_support_sar,
-                                                     max_support=self.max_support_sar)
+        print(f"   Found {len(sar_patterns)} candidate patterns in SAR")
         
-        non_issue_patterns = self._find_frequent_itemsets(non_issue_discrete,
-                                                          min_support=0,
-                                                          max_support=self.max_support_non_issue)
+        # Check their frequency in non-issue
+        print("\n3. Checking pattern frequency in non-issue class...")
+        rare_discriminative = []
         
-        # Calculate growth rates (emerging patterns)
-        emerging = []
-        
-        for pattern, sar_support in sar_patterns.items():
-            non_issue_support = non_issue_patterns.get(pattern, 0)
+        for pattern, sar_count in sar_patterns.items():
+            # Count in non-issue
+            ni_count = self._count_pattern(ni_features, pattern)
             
-            if non_issue_support < self.max_support_non_issue:
-                # Calculate growth rate
-                growth_rate = sar_support / (non_issue_support + 1e-6)
-                
-                # Calculate statistical significance
-                contingency = np.array([
-                    [sar_support * len(sar_df), (1 - sar_support) * len(sar_df)],
-                    [non_issue_support * len(non_issue_df), (1 - non_issue_support) * len(non_issue_df)]
-                ])
-                
-                if contingency.min() >= 5:
-                    _, p_value, _, _ = chi2_contingency(contingency)
-                else:
-                    _, p_value = fisher_exact(contingency)
-                
-                # Calculate confidence (precision)
-                confidence = (sar_support * len(sar_df)) / (
-                    sar_support * len(sar_df) + non_issue_support * len(non_issue_df) + 1e-6
-                )
-                
-                if confidence >= self.min_confidence and p_value < 0.01:
-                    emerging.append({
-                        'pattern': ' + '.join(sorted(pattern)),
-                        'pattern_items': pattern,
-                        'sar_support': sar_support,
-                        'non_issue_support': non_issue_support,
-                        'growth_rate': growth_rate,
-                        'confidence': confidence,
-                        'p_value': p_value,
-                        'sar_count': int(sar_support * len(sar_df)),
-                        'non_issue_count': int(non_issue_support * len(non_issue_df))
-                    })
+            # Filter by non-issue frequency
+            if ni_count > self.max_ni_support:
+                continue
+            
+            # Calculate precision
+            precision = sar_count / (sar_count + ni_count)
+            
+            if precision < self.min_precision:
+                continue
+            
+            # Statistical significance (Fisher's exact)
+            contingency = [
+                [sar_count, len(sar_df) - sar_count],
+                [ni_count, len(non_issue_df) - ni_count]
+            ]
+            
+            try:
+                odds_ratio, p_value = fisher_exact(contingency)
+            except:
+                continue
+            
+            if p_value >= 0.01:
+                continue
+            
+            rare_discriminative.append({
+                'pattern': ' + '.join(sorted(pattern)),
+                'pattern_items': pattern,
+                'sar_count': sar_count,
+                'ni_count': ni_count,
+                'sar_pct': sar_count / len(sar_df) * 100,
+                'ni_pct': ni_count / len(non_issue_df) * 100,
+                'precision': precision,
+                'odds_ratio': odds_ratio,
+                'p_value': p_value
+            })
         
-        return pd.DataFrame(emerging).sort_values('growth_rate', ascending=False)
+        if rare_discriminative:
+            df = pd.DataFrame(rare_discriminative)
+            df = df.sort_values('precision', ascending=False)
+            return df
+        
+        return pd.DataFrame()
     
-    def _find_frequent_itemsets(self, df, min_support=0.05, max_support=1.0, max_length=4):
-        """
-        Simplified frequent itemset mining using Apriori-like approach
-        """
-        n_transactions = len(df)
-        patterns = {}
+    def _find_itemsets(self, df, min_support, max_support, max_length=4):
+        """Find frequent itemsets in minority class"""
+        patterns = defaultdict(int)
         
-        # Convert DataFrame to transaction format
-        transactions = []
+        # Convert to transaction format
         for _, row in df.iterrows():
             transaction = set()
             for col in df.columns:
-                if pd.notna(row[col]):
-                    if isinstance(row[col], bool):
-                        if row[col]:
-                            transaction.add(col)
-                    elif isinstance(row[col], (int, float)):
-                        if row[col] == 1 or row[col] == True:
-                            transaction.add(col)
-                    else:
-                        transaction.add(f"{col}={row[col]}")
-            transactions.append(transaction)
-        
-        # Mine patterns of increasing length
-        for length in range(2, max_length + 1):
-            for transaction in transactions:
-                if len(transaction) >= length:
-                    for itemset in combinations(sorted(transaction), length):
-                        patterns[itemset] = patterns.get(itemset, 0) + 1
+                if pd.notna(row[col]) and row[col] == 1:
+                    transaction.add(col)
+            
+            # Generate itemsets of length 2-4
+            for length in range(2, min(max_length + 1, len(transaction) + 1)):
+                for itemset in combinations(sorted(transaction), length):
+                    patterns[itemset] += 1
         
         # Filter by support
-        filtered_patterns = {
-            pattern: count / n_transactions
+        filtered = {
+            pattern: count
             for pattern, count in patterns.items()
-            if min_support <= count / n_transactions <= max_support
+            if min_support <= count <= max_support
         }
         
-        return filtered_patterns
+        return filtered
     
-    def explain_pattern(self, pattern_items, sar_df, non_issue_df, narrative_col='NARRATIVE'):
-        """
-        Get example narratives and statistics for a specific pattern
-        """
-        # Find examples in SAR
-        sar_matches = self._match_pattern(sar_df, pattern_items)
-        non_issue_matches = self._match_pattern(non_issue_df, pattern_items)
-        
-        explanation = {
-            'pattern': ' + '.join(sorted(pattern_items)),
-            'sar_examples': sar_matches.head(5)[narrative_col].tolist() if len(sar_matches) > 0 else [],
-            'non_issue_examples': non_issue_matches.head(3)[narrative_col].tolist() if len(non_issue_matches) > 0 else [],
-            'sar_count': len(sar_matches),
-            'non_issue_count': len(non_issue_matches)
-        }
-        
-        return explanation
-    
-    def _match_pattern(self, df, pattern_items):
-        """
-        Find rows that match a pattern
-        """
+    def _count_pattern(self, df, pattern):
+        """Count how many rows match a pattern"""
         mask = pd.Series([True] * len(df), index=df.index)
         
-        for item in pattern_items:
-            if '=' in item:
-                col, val = item.split('=', 1)
-                if col in df.columns:
-                    mask &= (df[col].astype(str) == val)
-            else:
-                if item in df.columns:
-                    mask &= (df[item] == True) | (df[item] == 1)
+        for item in pattern:
+            if item in df.columns:
+                mask &= (df[item] == 1)
         
-        return df[mask]
+        return mask.sum()
 
 
-def run_rare_pattern_discovery(non_issue_df, sar_df):
+def run_imbalanced_rare_pattern_mining(non_issue_df, sar_df):
     """
-    Discover rare but highly indicative patterns
+    Run rare pattern mining optimized for severe imbalance
     """
     print("="*80)
-    print("RARE PATTERN DISCOVERY FOR AML ALERTS")
+    print("RARE PATTERN MINING - IMBALANCE OPTIMIZED")
     print("="*80)
+    print(f"Dataset: {len(non_issue_df):,} non-issue vs {len(sar_df):,} SAR")
+    print(f"Imbalance ratio: {len(non_issue_df)/len(sar_df):.1f}:1")
+    print("\nSearching for patterns that:")
+    print("  • Appear in 30-150 SARs (5-22% of minority class)")
+    print("  • Appear in <30 non-issue (<0.2% of majority class)")
+    print("  • Have >80% precision")
+    print("  • Are statistically significant (p<0.01)\n")
     
-    miner = RareContrastSetMiner(
-        min_support_sar=0.05,      # Pattern appears in 5%+ of SARs
-        max_support_sar=0.20,       # But not more than 20% (keep it rare)
-        max_support_non_issue=0.02, # And less than 2% of non-issue
-        min_confidence=0.70         # 70%+ precision
+    miner = ImbalancedRarePatternMiner(
+        min_sar_support=30,      # ~5% of 680
+        max_sar_support=150,     # ~22% of 680
+        max_ni_support=30,       # ~0.2% of 14,000
+        min_precision=0.80
     )
     
-    print("\n1. Creating combined feature space...")
-    sar_features = miner.create_combined_feature_space(sar_df)
-    non_issue_features = miner.create_combined_feature_space(non_issue_df)
+    # Mine patterns
+    patterns = miner.mine_rare_patterns(sar_df, non_issue_df)
     
-    print(f"   SAR features: {sar_features.shape}")
-    print(f"   Non-Issue features: {non_issue_features.shape}")
-    
-    print("\n2. Mining emerging patterns (this may take a few minutes)...")
-    emerging_patterns = miner.mine_emerging_patterns(sar_features, non_issue_features)
-    
-    print("\n" + "="*80)
-    print("TOP RARE BUT HIGHLY SUSPICIOUS PATTERNS")
-    print("="*80)
-    print("\nThese patterns are:")
-    print("  • RARE: Appear in only 5-20% of SARs")
-    print("  • DISCRIMINATIVE: Nearly absent in non-issue alerts (<2%)")
-    print("  • STATISTICALLY SIGNIFICANT: p < 0.01")
-    print("  • HIGH PRECISION: 70%+ confidence")
-    print()
-    
-    if len(emerging_patterns) > 0:
-        top_patterns = emerging_patterns.head(20)
-        
-        for idx, row in top_patterns.iterrows():
-            print(f"\nPattern #{idx + 1}:")
-            print(f"  {row['pattern']}")
-            print(f"  • Found in: {row['sar_count']} SARs ({row['sar_support']*100:.1f}%) vs {row['non_issue_count']} non-issue ({row['non_issue_support']*100:.2f}%)")
-            print(f"  • Growth Rate: {row['growth_rate']:.1f}x more likely in SARs")
-            print(f"  • Precision: {row['confidence']*100:.1f}%")
-            print(f"  • Statistical significance: p={row['p_value']:.4f}")
-        
-        # Get detailed examples for top pattern
-        if len(top_patterns) > 0:
-            print("\n" + "="*80)
-            print("DETAILED EXAMPLE: TOP PATTERN")
-            print("="*80)
-            
-            top_pattern = top_patterns.iloc[0]
-            explanation = miner.explain_pattern(
-                top_pattern['pattern_items'],
-                sar_df,
-                non_issue_df
-            )
-            
-            print(f"\nPattern: {explanation['pattern']}")
-            print(f"\nExample SAR narratives with this pattern:")
-            for i, narrative in enumerate(explanation['sar_examples'][:3], 1):
-                print(f"\n{i}. {str(narrative)[:300]}...")
-            
-            if explanation['non_issue_examples']:
-                print(f"\nRare non-issue examples (for comparison):")
-                for i, narrative in enumerate(explanation['non_issue_examples'][:2], 1):
-                    print(f"\n{i}. {str(narrative)[:300]}...")
-        
-        # Save results
-        emerging_patterns.to_csv('rare_emerging_patterns.csv', index=False)
+    if len(patterns) > 0:
         print("\n" + "="*80)
-        print(f"✓ Results saved to 'rare_emerging_patterns.csv'")
-        print(f"✓ Found {len(emerging_patterns)} rare but highly suspicious patterns")
+        print("RARE BUT HIGHLY INDICATIVE PATTERNS")
+        print("="*80)
+        print(f"\nFound {len(patterns)} rare patterns meeting criteria:\n")
         
-        return emerging_patterns
+        print(f"{'Pattern':<80} {'SAR':<6} {'NI':<6} {'Prec':<6} {'OR':<8}")
+        print("-" * 110)
+        
+        for _, row in patterns.head(30).iterrows():
+            pattern_str = row['pattern'][:75] + "..." if len(row['pattern']) > 75 else row['pattern']
+            print(f"{pattern_str:<80} "
+                  f"{row['sar_count']:>5} "
+                  f"{row['ni_count']:>5} "
+                  f"{row['precision']*100:>5.1f}% "
+                  f"{row['odds_ratio']:>7.1f}")
+        
+        # Show detailed examples for top patterns
+        print("\n" + "="*80)
+        print("DETAILED PATTERN EXAMPLES")
+        print("="*80)
+        
+        for idx, row in patterns.head(5).iterrows():
+            print(f"\n{'='*70}")
+            print(f"Pattern: {row['pattern']}")
+            print(f"  • Found in {row['sar_count']} SARs ({row['sar_pct']:.1f}%)")
+            print(f"  • Found in {row['ni_count']} non-issue ({row['ni_pct']:.2f}%)")
+            print(f"  • Precision: {row['precision']*100:.1f}%")
+            print(f"  • Odds Ratio: {row['odds_ratio']:.1f}x")
+            print(f"  • Statistical significance: p={row['p_value']:.2e}")
+        
+        # Save
+        patterns.to_csv('rare_patterns_imbalanced.csv', index=False)
+        
+        print("\n" + "="*80)
+        print(f"✓ Results saved to 'rare_patterns_imbalanced.csv'")
+        print(f"✓ Found {len(patterns)} rare but high-precision SAR patterns")
+        
+        return patterns
     else:
-        print("\nNo patterns found matching the criteria.")
-        print("Try adjusting parameters (min_support_sar, max_support_non_issue, min_confidence)")
+        print("\nNo patterns found meeting the criteria.")
+        print("Consider adjusting parameters:")
+        print("  • Lower min_sar_support (currently 30)")
+        print("  • Increase max_ni_support (currently 30)")
+        print("  • Lower min_precision (currently 0.80)")
         return pd.DataFrame()
 
 
 # Example usage:
 """
-# Load your data with transaction features already included
-non_issue_df = pd.read_csv('non_issue_alerts_with_features.csv')
-sar_df = pd.read_csv('sar_alerts_with_features.csv')
+non_issue_df = pd.read_csv('non_issue_alerts.csv')  # Should have NARRATIVE column
+sar_df = pd.read_csv('sar_alerts.csv')
 
-# Make sure you have a NARRATIVE column
-# Other columns can be any transaction features from your 130+ feature model
-
-# Run rare pattern discovery
-patterns = run_rare_pattern_discovery(non_issue_df, sar_df)
+patterns = run_imbalanced_rare_pattern_mining(non_issue_df, sar_df)
 
 # Analyze specific patterns
 if len(patterns) > 0:
-    # Get patterns involving specific features
-    jewelry_patterns = patterns[patterns['pattern'].str.contains('jewelry|jewellery')]
-    print(f"\nFound {len(jewelry_patterns)} patterns involving jewelry purchases")
-    
-    # Get patterns with narrative signals
-    narrative_patterns = patterns[patterns['pattern'].str.contains('narrative_')]
-    print(f"\nFound {len(narrative_patterns)} patterns combining transactions + narrative signals")
+    # Find patterns involving specific features
+    verification_patterns = patterns[
+        patterns['pattern'].str.contains('narr_unable_verify')
+    ]
+    print(f"\nPatterns involving verification failure: {len(verification_patterns)}")
+    print(verification_patterns[['pattern', 'precision', 'sar_count']])
 """
